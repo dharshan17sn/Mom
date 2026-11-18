@@ -1,0 +1,20 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Ephemeral runtime outputs and user uploads
+data/output/
+data/uploads/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

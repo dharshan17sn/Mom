@@ -1,0 +1,369 @@
+"""
+MA375TGR | Mathematics of Music
+Multi-Stem Audio Separation and Parametric Equalization with LLM-Driven Natural Language Control
+Interactive Streamlit Application
+"""
+
+import os
+import sys
+import json
+import numpy as np
+import streamlit as st
+
+# Add current workspace to python path
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
+from src.phase1_separation import (
+    STEM_NAMES,
+    DEFAULT_SR,
+    load_audio,
+    save_audio,
+    create_stock_preset,
+    StemSeparator
+)
+from src.phase2_llm import (
+    LLMReasoningEngine,
+    EQPlan,
+    FilterEdit,
+    FilterType,
+    StemType,
+    DESCRIPTOR_SPECS
+)
+from src.phase3_dsp import BiquadFilter, DSPEngine
+from src.visualization import plot_filter_curves, plot_before_after_spectrogram
+
+
+# Page Configuration
+st.set_page_config(
+    page_title="Multi-Stem Audio EQ | LLM Control",
+    page_icon="🎛️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom Styling
+st.markdown("""
+<style>
+    .main { background-color: #0d1117; color: #f0f6fc; }
+    .stApp { background: linear-gradient(180deg, #0d1117 0%, #161b22 100%); }
+    .project-header {
+        background: linear-gradient(90deg, #1e293b 0%, #0f172a 100%);
+        border: 1px solid #334155;
+        border-radius: 10px;
+        padding: 20px 24px;
+        margin-bottom: 25px;
+    }
+    .stem-card {
+        background-color: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 12px;
+        margin-bottom: 12px;
+    }
+    .badge {
+        display: inline-block;
+        padding: 3px 8px;
+        font-size: 11px;
+        font-weight: 600;
+        border-radius: 4px;
+        background: #0284c7;
+        color: white;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+def init_session_state():
+    if "preset_loaded" not in st.session_state:
+        st.session_state.preset_loaded = False
+    if "mix_path" not in st.session_state:
+        st.session_state.mix_path = None
+    if "stem_paths" not in st.session_state:
+        st.session_state.stem_paths = {}
+    if "eq_plan" not in st.session_state:
+        st.session_state.eq_plan = None
+    if "dsp_results" not in st.session_state:
+        st.session_state.dsp_results = None
+
+
+init_session_state()
+
+# ----------------- SIDEBAR CONTROLS -----------------
+with st.sidebar:
+    st.markdown("### 🎛️ System Configuration")
+
+    # Audio Preset Loader
+    st.subheader("1. Audio Source")
+    audio_source = st.radio(
+        "Select Audio Source:",
+        [
+            "High-Contrast Benchmark (Audible Boxy Vocal & Harsh Drums)",
+            "Stock Preset: Funk / Lo-Fi Groove",
+            "Upload Custom Audio (.wav / .mp3)"
+        ]
+    )
+
+    if audio_source == "High-Contrast Benchmark (Audible Boxy Vocal & Harsh Drums)":
+        preset_dir = os.path.join("data", "presets", "high_contrast_demo")
+        if not os.path.exists(os.path.join(preset_dir, "mixture.wav")):
+            with st.spinner("Generating High-Contrast Benchmark preset..."):
+                from src.phase1_separation import create_high_contrast_preset
+                mix_p, stems_p = create_high_contrast_preset(preset_dir)
+                st.session_state.mix_path = mix_p
+                st.session_state.stem_paths = stems_p
+        else:
+            st.session_state.mix_path = os.path.join(preset_dir, "mixture.wav")
+            st.session_state.stem_paths = {
+                name: os.path.join(preset_dir, f"{name}.wav") for name in STEM_NAMES
+            }
+        st.success("✔ High-Contrast Benchmark Preset Active")
+
+    elif audio_source == "Stock Preset: Funk / Lo-Fi Groove":
+        preset_dir = os.path.join("data", "presets", "stock_funk_groove")
+        if not st.session_state.preset_loaded or not os.path.exists(os.path.join(preset_dir, "mixture.wav")):
+            with st.spinner("Generating 4-stem stock preset..."):
+                mix_p, stems_p = create_stock_preset(preset_dir)
+                st.session_state.mix_path = mix_p
+                st.session_state.stem_paths = stems_p
+                st.session_state.preset_loaded = True
+        else:
+            st.session_state.mix_path = os.path.join(preset_dir, "mixture.wav")
+            st.session_state.stem_paths = {
+                name: os.path.join(preset_dir, f"{name}.wav") for name in STEM_NAMES
+            }
+        st.success("✔ Stock 4-Stem Preset Loaded (44.1 kHz Stereo)")
+    else:
+        uploaded_file = st.file_uploader("Upload Mix Track", type=["wav", "mp3"])
+        if uploaded_file is not None:
+            upload_path = os.path.join("data", "uploads", uploaded_file.name)
+            os.makedirs(os.path.dirname(upload_path), exist_ok=True)
+            with open(upload_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            st.session_state.mix_path = upload_path
+
+            separator = StemSeparator()
+            sep_out_dir = os.path.join("data", "output", "user_separated_stems")
+            with st.spinner("Splitting track into 4 stems..."):
+                st.session_state.stem_paths = separator.separate(upload_path, output_dir=sep_out_dir)
+            st.success("✔ Stems ready")
+
+    st.markdown("---")
+    st.subheader("2. AI Reasoning Engine")
+    engine = LLMReasoningEngine()
+    ollama_online = engine.is_ollama_available()
+
+    llm_choice = st.selectbox(
+        "Reasoning Backend:",
+        [
+            f"Ollama Local LLM ({'ONLINE' if ollama_online else 'OFFLINE'})",
+            "Deterministic Psychoacoustic Rules (Offline)"
+        ]
+    )
+    force_expert = "Psychoacoustic" in llm_choice or not ollama_online
+
+    st.markdown("---")
+    st.subheader("3. DSP Processing Mode")
+    dsp_mode = st.radio(
+        "Filter Architecture:",
+        ["STFT Bin Gain (Hann N=2048, hop=512)", "Time-Domain Biquad SOS"]
+    )
+    mode_key = "stft" if "STFT" in dsp_mode else "sos"
+
+    st.markdown("---")
+    st.caption("MA375TGR Mathematics of Music\nAuthors: Bharath Kumar MS, Dharshan SN, Dheeraj R")
+
+
+# ----------------- MAIN HEADER -----------------
+st.markdown("""
+<div class="project-header">
+    <div style="font-size: 13px; color: #38bdf8; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase;">
+        MA375TGR | Mathematics of Music
+    </div>
+    <h2 style="margin: 4px 0 8px 0; color: #ffffff;">
+        Multi-Stem Audio Separation & Parametric EQ with LLM-Driven Natural Language Control
+    </h2>
+    <p style="margin: 0; color: #94a3b8; font-size: 14px;">
+        AI interprets natural language timbre descriptors into exact biquad filters, deterministic DSP processes the audio samples.
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ----------------- SECTION 1: STEM MIXER -----------------
+st.markdown("### 1. Multi-Stem Audio Input & Stems")
+mix_col, stems_col = st.columns([1, 2])
+
+with mix_col:
+    st.markdown("#### 🎧 Full Mixed Track $x(t)$")
+    if st.session_state.mix_path and os.path.exists(st.session_state.mix_path):
+        st.audio(st.session_state.mix_path)
+        mix_data, sr = load_audio(st.session_state.mix_path)
+        st.caption(f"Channels: Stereo | Sample Rate: {sr} Hz | Duration: {mix_data.shape[-1]/sr:.1f}s")
+    else:
+        st.info("Load audio from sidebar.")
+
+with stems_col:
+    st.markdown("#### 🧩 Isolated Stems (Demucs 4-Stem Model)")
+    col_v, col_d, col_b, col_o = st.columns(4)
+
+    cols = {"vocals": col_v, "drums": col_d, "bass": col_b, "other": col_o}
+    icons = {"vocals": "🎤 Vocals", "drums": "🥁 Drums", "bass": "🎸 Bass", "other": "🎹 Other"}
+
+    for name in STEM_NAMES:
+        with cols[name]:
+            st.markdown(f"**{icons[name]}**")
+            p = st.session_state.stem_paths.get(name)
+            if p and os.path.exists(p):
+                st.audio(p)
+            else:
+                st.caption("Not loaded")
+
+st.markdown("---")
+
+
+# ----------------- SECTION 2: NATURAL LANGUAGE PROMPT -----------------
+st.markdown("### 2. Natural Language Timbre Control (LLM Reasoning Layer)")
+
+# Quick preset prompts
+example_prompts = [
+    "The vocal sounds too boxy and muddy, and I want the bass kick to have more punch.",
+    "The drums are too harsh in the cymbals, add air to the vocals, and make the bass warmer.",
+    "Tame sibilance on the singer and eliminate sub-rumble below 35 Hz on the mix.",
+    "Boost the vocal presence by +3 dB at 2500 Hz and make the keyboards brighter."
+]
+
+selected_example = st.selectbox("Quick Preset Prompts (or type custom below):", ["-- Custom Prompt --"] + example_prompts)
+
+default_text = example_prompts[0] if selected_example == "-- Custom Prompt --" else selected_example
+user_prompt = st.text_input("Enter natural language mixing instruction:", value=default_text)
+
+col_slider, col_run = st.columns([2, 1])
+with col_slider:
+    intensity = st.slider("🔊 EQ Intensity Multiplier (Increase if changes are subtle on laptop speakers):", min_value=1.0, max_value=2.5, value=1.6, step=0.1)
+with col_run:
+    st.write("")
+    run_button = st.button("🚀 Process Audio with AI", type="primary", use_container_width=True)
+
+if run_button and user_prompt:
+    with st.spinner("Translating natural language to biquad filter parameters..."):
+        plan = engine.generate_plan(user_prompt, force_expert_rules=force_expert)
+        # Apply intensity scaling to make EQ boldly audible
+        if intensity != 1.0:
+            for edit in plan.edits:
+                edit.gain_db = max(-12.0, min(12.0, round(edit.gain_db * intensity, 1)))
+        st.session_state.eq_plan = plan
+
+    with st.spinner("Executing deterministic DSP & Resynthesizing master mix..."):
+        dsp = DSPEngine(mode=mode_key, fs=DEFAULT_SR)
+        out_dir = os.path.join("data", "output", "live_master_output")
+        results = dsp.process_stems(st.session_state.stem_paths, plan, output_dir=out_dir)
+        st.session_state.dsp_results = results
+
+    st.success("✔ Audio successfully equalized and resynthesized!")
+
+
+# ----------------- DISPLAY LLM REASONING JSON & FILTER CURVES -----------------
+if st.session_state.eq_plan is not None:
+    plan: EQPlan = st.session_state.eq_plan
+
+    st.markdown(f"**Engineering Summary**: *{plan.summary}* &nbsp; <span class='badge'>Source: {plan.source.upper()}</span>", unsafe_allow_html=True)
+
+    json_col, curve_col = st.columns([1, 1])
+
+    with json_col:
+        st.markdown("#### 📋 Validated Biquad Parameter JSON (Slide 10)")
+        st.json(plan.model_dump()["edits"])
+
+    with curve_col:
+        st.markdown("#### 📈 Cascaded Biquad Transfer Function $H(z)$")
+        all_filters = [
+            BiquadFilter(
+                filter_type=e.filter.value,
+                f0_hz=e.f0_hz,
+                gain_db=e.gain_db,
+                q=e.q,
+                fs=DEFAULT_SR
+            ) for e in plan.edits
+        ]
+        if all_filters:
+            fig_curve = plot_filter_curves(all_filters)
+            st.pyplot(fig_curve)
+        else:
+            st.info("No active filter curves.")
+
+
+# ----------------- SECTION 3: RESYNTHESIZED MASTER & A/B COMPARISON -----------------
+if st.session_state.dsp_results is not None:
+    res = st.session_state.dsp_results
+
+    st.markdown("---")
+    st.markdown("### 3. Resynthesized Audio Master (A/B Comparison)")
+
+    orig_col, proc_col = st.columns(2)
+
+    with orig_col:
+        st.markdown("#### ⚪ Original Mix $x(t)$")
+        st.audio(st.session_state.mix_path)
+
+    with proc_col:
+        st.markdown("#### 🔵 Polished Master Mix $x_{\\text{master}}(t)$")
+        st.audio(res["master_mix_path"])
+        with open(res["master_mix_path"], "rb") as f:
+            st.download_button(
+                label="⬇️ Download Polished Master (.wav)",
+                data=f.read(),
+                file_name="polished_master_mix.wav",
+                mime="audio/wav"
+            )
+
+    st.markdown("#### 🎚️ Direct Stem A/B Solo Comparison (Hear exact differences in isolation)")
+    st.caption("Listening to individual stems isolates the EQ change from other instruments masking it.")
+
+    col_orig_stem, col_proc_stem = st.columns(2)
+    selected_ab_stem = st.selectbox("Select Stem for Solo A/B Audition:", ["vocals", "drums", "bass", "other"])
+
+    with col_orig_stem:
+        st.markdown(f"**Before (Original {selected_ab_stem.capitalize()})**")
+        st.audio(st.session_state.stem_paths[selected_ab_stem])
+
+    with col_proc_stem:
+        st.markdown(f"**After (Processed {selected_ab_stem.capitalize()})**")
+        st.audio(res["stem_paths"][selected_ab_stem])
+
+    # Delta / Null Test
+    orig_s, sr_s = load_audio(st.session_state.stem_paths[selected_ab_stem])
+    proc_s, _ = load_audio(res["stem_paths"][selected_ab_stem])
+    delta_s = orig_s - proc_s
+
+    delta_path = os.path.join("data", "output", f"delta_{selected_ab_stem}.wav")
+    save_audio(delta_path, delta_s, sr=sr_s, normalize=True)
+
+    with st.expander(f"🔍 Listen to Delta / Null Test Signal (The exact frequencies removed/altered from {selected_ab_stem.capitalize()})"):
+        st.audio(delta_path)
+        st.caption("The Delta signal plays ONLY the acoustic difference (e.g. the removed boxy 300 Hz resonance). If you hear audio here, the EQ definitely reshaped the sound!")
+
+
+    # ----------------- SECTION 4: LIVE SPECTROGRAM VISUALIZATION -----------------
+    st.markdown("---")
+    st.markdown("### 4. Live Before / After Spectrogram Analysis (Slide 14)")
+
+    selected_stem_view = st.selectbox(
+        "Select Track to Inspect in Spectrogram:",
+        ["vocals", "drums", "bass", "other", "master mix"]
+    )
+
+    if selected_stem_view == "master mix":
+        orig_data, fs = load_audio(st.session_state.mix_path)
+        proc_data, _ = load_audio(res["master_mix_path"])
+    else:
+        orig_data, fs = load_audio(st.session_state.stem_paths[selected_stem_view])
+        proc_data, _ = load_audio(res["stem_paths"][selected_stem_view])
+
+    spec_fig = plot_before_after_spectrogram(
+        orig_data,
+        proc_data,
+        fs=fs,
+        stem_name=selected_stem_view
+    )
+    st.pyplot(spec_fig)
+
