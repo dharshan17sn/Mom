@@ -1,14 +1,17 @@
 """
 Phase 2: LLM Reasoning Engine
-Handles Natural Language to Biquad EQ JSON translation via Ollama (Llama-3.2 / Qwen2.5)
-with automatic fallback to the psychoacoustic rule-based expert parser.
+Handles Natural Language to Biquad EQ JSON translation via:
+1. Local Ollama Models (Llama-3.2, Qwen2.5, Mistral) via official ollama SDK
+2. Cloud Frontier LLM API (Google Gemini / OpenAI compatible)
+3. Deterministic Psychoacoustic Expert System (offline rule-based baseline)
 """
 
 import json
 import urllib.request
 import urllib.error
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
+import ollama
 from .schema import EQPlan, FilterEdit, StemType, FilterType
 from .psychoacoustics import parse_expert_rules
 
@@ -29,7 +32,7 @@ Supported filter topologies:
 - "highpass": Low cut / rumble filter
 - "notch": Narrow cut for sharp resonances
 
-Psychoacoustic Guidelines:
+Psychoacoustic Guidelines (Slide 11):
 - "punchy kick / punchy bass": boost 60 - 100 Hz (+3 to +6 dB, Q=1.0 to 1.4)
 - "warm / muddy": cut 200 - 400 Hz (-3 to -6 dB, Q=1.2 to 1.5) to fix mud; boost 100 - 250 Hz for warmth.
 - "boxy": cut 300 - 600 Hz (-3 to -5 dB, Q=1.4 to 1.8) on vocals/snare.
@@ -49,7 +52,7 @@ You MUST return ONLY a valid JSON object matching this schema, with no preamble 
     {
       "stem": "vocals",
       "filter": "peaking",
-      "f0_hz": 300,
+      "f0_hz": 300.0,
       "gain_db": -4.0,
       "q": 1.4,
       "description": "Cut boxy resonance around 300 Hz"
@@ -62,76 +65,148 @@ You MUST return ONLY a valid JSON object matching this schema, with no preamble 
 
 class LLMReasoningEngine:
     """
-    Translates natural language to EQPlan using local Ollama LLM,
-    with zero-latency fallback to rule-based psychoacoustic expert system.
+    Translates natural language requests into structured Biquad EQPlans.
+    Supports official Ollama Python SDK, Cloud LLM APIs, and Offline Expert Rules.
     """
 
     def __init__(
         self,
         model_name: str = "llama3.2",
-        ollama_url: str = "http://localhost:11434/api/generate",
-        timeout_seconds: float = 8.0
+        ollama_host: str = "http://127.0.0.1:11434"
     ):
         self.model_name = model_name
-        self.ollama_url = ollama_url
-        self.timeout_seconds = timeout_seconds
+        self.ollama_host = ollama_host
+        self.client = ollama.Client(host=self.ollama_host)
 
     def is_ollama_available(self) -> bool:
-        """Check if local Ollama server is responding."""
+        """Checks if local Ollama daemon is reachable."""
         try:
-            req = urllib.request.Request("http://localhost:11434/", method="GET")
-            with urllib.request.urlopen(req, timeout=1.0) as resp:
-                return resp.status == 200
+            self.client.list()
+            return True
         except Exception:
             return False
 
-    def generate_plan(self, prompt: str, force_expert_rules: bool = False) -> EQPlan:
-        """
-        Translates prompt into an EQPlan.
-        If force_expert_rules is True or Ollama is offline, uses the expert rules parser.
-        """
-        if force_expert_rules or not self.is_ollama_available():
-            # Use deterministic psychoacoustic knowledge base
-            return parse_expert_rules(prompt)
-
-        # Query local Ollama instance
+    def list_installed_ollama_models(self) -> List[str]:
+        """Returns list of all model names currently pulled in Ollama."""
         try:
-            payload = {
-                "model": self.model_name,
-                "prompt": f"{SYSTEM_PROMPT}\nUser Request: {prompt}\nJSON Output:",
-                "stream": False,
-                "format": "json",
-                "options": {
-                    "temperature": 0.1,  # Low temperature per slide 10
-                    "top_p": 0.9
-                }
-            }
+            resp = self.client.list()
+            # ollama.list() returns ListResponse with models attribute
+            models = resp.get("models", []) if isinstance(resp, dict) else getattr(resp, "models", [])
+            names = []
+            for m in models:
+                name = m.get("model", "") if isinstance(m, dict) else getattr(m, "model", "")
+                if name:
+                    names.append(name)
+            return names
+        except Exception:
+            return []
 
-            req = urllib.request.Request(
-                self.ollama_url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST"
+    def pull_ollama_model(self, model_name: str) -> None:
+        """Pulls a model (e.g. llama3.2 or qwen2.5) via Ollama."""
+        self.client.pull(model_name)
+
+    def generate_with_ollama(self, prompt: str, model_name: Optional[str] = None) -> EQPlan:
+        """
+        Executes real local neural LLM inference via Ollama.
+        Uses structured JSON output mode with low temperature.
+        """
+        target_model = model_name or self.model_name
+        print(f"[Ollama] Querying model '{target_model}'...")
+
+        response = self.client.chat(
+            model=target_model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"User Request: {prompt}\nJSON Output:"}
+            ],
+            format="json",
+            options={
+                "temperature": 0.1,  # Low temperature per Slide 10
+                "top_p": 0.9
+            }
+        )
+
+        content = response["message"]["content"]
+        data = json.loads(content)
+
+        raw_edits = data.get("edits", [])
+        summary = data.get("summary", f"Ollama ({target_model}) parametric EQ plan")
+        validated_edits = [FilterEdit(**e) for e in raw_edits]
+
+        return EQPlan(
+            user_prompt=prompt,
+            edits=validated_edits,
+            summary=summary,
+            source=f"ollama_{target_model}"
+        )
+
+    def generate_with_gemini_api(self, prompt: str, api_key: str, model: str = "gemini-1.5-flash") -> EQPlan:
+        """
+        Executes inference via Google Gemini API for real-time cloud LLM reasoning.
+        """
+        import urllib.request
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": f"{SYSTEM_PROMPT}\nUser Request: {prompt}\nJSON Output:"}
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "response_mime_type": "application/json"
+            }
+        }
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+
+        with urllib.request.urlopen(req, timeout=12.0) as resp:
+            res_data = json.loads(resp.read().decode("utf-8"))
+            candidate = res_data["candidates"][0]["content"]["parts"][0]["text"]
+            data = json.loads(candidate)
+
+            raw_edits = data.get("edits", [])
+            summary = data.get("summary", f"Gemini ({model}) parametric EQ plan")
+            validated_edits = [FilterEdit(**e) for e in raw_edits]
+
+            return EQPlan(
+                user_prompt=prompt,
+                edits=validated_edits,
+                summary=summary,
+                source=f"gemini_{model}"
             )
 
-            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as response:
-                result = json.loads(response.read().decode("utf-8"))
-                response_text = result.get("response", "{}")
-                data = json.loads(response_text)
+    def generate_plan(
+        self,
+        prompt: str,
+        backend_mode: str = "auto",
+        model_name: Optional[str] = None,
+        api_key: Optional[str] = None
+    ) -> EQPlan:
+        """
+        Unified router for plan generation:
+        - "ollama": Force Ollama local LLM
+        - "gemini": Force Gemini API
+        - "rules": Force Deterministic Psychoacoustic rules
+        - "auto": Try Ollama, if offline fallback to rules.
+        """
+        if backend_mode == "gemini" and api_key:
+            return self.generate_with_gemini_api(prompt, api_key=api_key)
 
-                raw_edits = data.get("edits", [])
-                summary = data.get("summary", "LLM-generated parametric EQ plan")
+        if backend_mode == "ollama" or (backend_mode == "auto" and self.is_ollama_available()):
+            try:
+                return self.generate_with_ollama(prompt, model_name=model_name)
+            except Exception as e:
+                print(f"[LLM Engine] Ollama error ({e}). Falling back to Psychoacoustic Expert Rules.")
+                return parse_expert_rules(prompt)
 
-                validated_edits = [FilterEdit(**e) for e in raw_edits]
-
-                return EQPlan(
-                    user_prompt=prompt,
-                    edits=validated_edits,
-                    summary=summary,
-                    source="llm"
-                )
-
-        except Exception as e:
-            print(f"[LLM Engine] Ollama query failed ({e}). Falling back to Psychoacoustic Expert Rules.")
-            return parse_expert_rules(prompt)
-
+        # Offline deterministic psychoacoustic rules
+        return parse_expert_rules(prompt)

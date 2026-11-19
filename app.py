@@ -7,6 +7,7 @@ Interactive Streamlit Application
 import os
 import sys
 import json
+import hashlib
 import numpy as np
 import streamlit as st
 
@@ -19,6 +20,7 @@ from src.phase1_separation import (
     load_audio,
     save_audio,
     create_stock_preset,
+    create_high_contrast_preset,
     StemSeparator
 )
 from src.phase2_llm import (
@@ -35,7 +37,7 @@ from src.visualization import plot_filter_curves, plot_before_after_spectrogram
 
 # Page Configuration
 st.set_page_config(
-    page_title="Multi-Stem Audio EQ | LLM Control",
+    page_title="Multi-Stem Audio EQ | Real-Time Neural & LLM Control",
     page_icon="🎛️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -53,14 +55,25 @@ st.markdown("""
         padding: 20px 24px;
         margin-bottom: 25px;
     }
-    .stem-card {
-        background-color: #161b22;
-        border: 1px solid #30363d;
-        border-radius: 8px;
-        padding: 12px;
-        margin-bottom: 12px;
+    .badge-online {
+        display: inline-block;
+        padding: 3px 8px;
+        font-size: 11px;
+        font-weight: 600;
+        border-radius: 4px;
+        background: #10b981;
+        color: white;
     }
-    .badge {
+    .badge-offline {
+        display: inline-block;
+        padding: 3px 8px;
+        font-size: 11px;
+        font-weight: 600;
+        border-radius: 4px;
+        background: #ef4444;
+        color: white;
+    }
+    .badge-model {
         display: inline-block;
         padding: 3px 8px;
         font-size: 11px;
@@ -74,8 +87,8 @@ st.markdown("""
 
 
 def init_session_state():
-    if "preset_loaded" not in st.session_state:
-        st.session_state.preset_loaded = False
+    if "current_track_id" not in st.session_state:
+        st.session_state.current_track_id = None
     if "mix_path" not in st.session_state:
         st.session_state.mix_path = None
     if "stem_paths" not in st.session_state:
@@ -88,26 +101,32 @@ def init_session_state():
 
 init_session_state()
 
+# Initialize engines
+separator = StemSeparator(model_name="htdemucs")
+llm_engine = LLMReasoningEngine()
+ollama_online = llm_engine.is_ollama_available()
+
+
 # ----------------- SIDEBAR CONTROLS -----------------
 with st.sidebar:
     st.markdown("### 🎛️ System Configuration")
 
-    # Audio Preset Loader
-    st.subheader("1. Audio Source")
+    # 1. Audio Source Selection
+    st.subheader("1. Audio Input Track")
     audio_source = st.radio(
-        "Select Audio Source:",
+        "Choose Audio Source:",
         [
             "High-Contrast Benchmark (Audible Boxy Vocal & Harsh Drums)",
             "Stock Preset: Funk / Lo-Fi Groove",
-            "Upload Custom Audio (.wav / .mp3)"
+            "Upload Custom Audio (.wav / .mp3) [Real Neural Demucs]"
         ]
     )
 
     if audio_source == "High-Contrast Benchmark (Audible Boxy Vocal & Harsh Drums)":
+        track_id = "preset_high_contrast"
         preset_dir = os.path.join("data", "presets", "high_contrast_demo")
         if not os.path.exists(os.path.join(preset_dir, "mixture.wav")):
-            with st.spinner("Generating High-Contrast Benchmark preset..."):
-                from src.phase1_separation import create_high_contrast_preset
+            with st.spinner("Synthesizing High-Contrast Benchmark preset..."):
                 mix_p, stems_p = create_high_contrast_preset(preset_dir)
                 st.session_state.mix_path = mix_p
                 st.session_state.stem_paths = stems_p
@@ -116,55 +135,113 @@ with st.sidebar:
             st.session_state.stem_paths = {
                 name: os.path.join(preset_dir, f"{name}.wav") for name in STEM_NAMES
             }
-        st.success("✔ High-Contrast Benchmark Preset Active")
+        st.session_state.current_track_id = track_id
+        st.success("✔ High-Contrast Benchmark Active")
 
     elif audio_source == "Stock Preset: Funk / Lo-Fi Groove":
+        track_id = "preset_funk_groove"
         preset_dir = os.path.join("data", "presets", "stock_funk_groove")
-        if not st.session_state.preset_loaded or not os.path.exists(os.path.join(preset_dir, "mixture.wav")):
-            with st.spinner("Generating 4-stem stock preset..."):
+        if not os.path.exists(os.path.join(preset_dir, "mixture.wav")):
+            with st.spinner("Synthesizing 4-stem stock preset..."):
                 mix_p, stems_p = create_stock_preset(preset_dir)
                 st.session_state.mix_path = mix_p
                 st.session_state.stem_paths = stems_p
-                st.session_state.preset_loaded = True
         else:
             st.session_state.mix_path = os.path.join(preset_dir, "mixture.wav")
             st.session_state.stem_paths = {
                 name: os.path.join(preset_dir, f"{name}.wav") for name in STEM_NAMES
             }
-        st.success("✔ Stock 4-Stem Preset Loaded (44.1 kHz Stereo)")
+        st.session_state.current_track_id = track_id
+        st.success("✔ Stock 4-Stem Preset Active")
+
     else:
-        uploaded_file = st.file_uploader("Upload Mix Track", type=["wav", "mp3"])
+        uploaded_file = st.file_uploader("Upload Any Music Track (.wav, .mp3)", type=["wav", "mp3"])
         if uploaded_file is not None:
-            upload_path = os.path.join("data", "uploads", uploaded_file.name)
+            upload_name = uploaded_file.name
+            file_bytes = uploaded_file.getbuffer()
+            file_hash = hashlib.md5(file_bytes[:1024 * 512]).hexdigest()[:8]
+            track_id = f"upload_{upload_name}_{file_hash}"
+
+            upload_path = os.path.join("data", "uploads", upload_name)
             os.makedirs(os.path.dirname(upload_path), exist_ok=True)
             with open(upload_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
+                f.write(file_bytes)
+
             st.session_state.mix_path = upload_path
 
-            separator = StemSeparator()
-            sep_out_dir = os.path.join("data", "output", "user_separated_stems")
-            with st.spinner("Splitting track into 4 stems..."):
-                st.session_state.stem_paths = separator.separate(upload_path, output_dir=sep_out_dir)
-            st.success("✔ Stems ready")
+            # Only separate if this is a newly uploaded track
+            if st.session_state.current_track_id != track_id:
+                st.info(f"New track uploaded: {upload_name}. Running real Demucs 4-stem separation...")
+                prog_bar = st.progress(0.0)
+                status_txt = st.empty()
+
+                def update_progress(pct, msg):
+                    prog_bar.progress(pct)
+                    status_txt.text(msg)
+
+                try:
+                    separated_stems = separator.separate(
+                        upload_path,
+                        progress_callback=update_progress
+                    )
+                    st.session_state.stem_paths = separated_stems
+                    st.session_state.current_track_id = track_id
+                    status_txt.empty()
+                    prog_bar.empty()
+                    st.success(f"✔ Real Demucs separation completed for {upload_name}!")
+                except Exception as e:
+                    st.error(f"Separation failed: {e}")
 
     st.markdown("---")
+
+    # 2. AI Reasoning Engine Selection
     st.subheader("2. AI Reasoning Engine")
-    engine = LLMReasoningEngine()
-    ollama_online = engine.is_ollama_available()
+    if ollama_online:
+        st.markdown("<span class='badge-online'>OLLAMA DAEMON: CONNECTED</span>", unsafe_allow_html=True)
+        installed_models = llm_engine.list_installed_ollama_models()
+        if not installed_models:
+            installed_models = ["llama3.2", "qwen2.5"]
+    else:
+        st.markdown("<span class='badge-offline'>OLLAMA DAEMON: OFFLINE (localhost:11434)</span>", unsafe_allow_html=True)
+        installed_models = ["llama3.2", "qwen2.5"]
 
-    llm_choice = st.selectbox(
-        "Reasoning Backend:",
-        [
-            f"Ollama Local LLM ({'ONLINE' if ollama_online else 'OFFLINE'})",
-            "Deterministic Psychoacoustic Rules (Offline)"
-        ]
-    )
-    force_expert = "Psychoacoustic" in llm_choice or not ollama_online
+    engine_options = []
+    if ollama_online:
+        engine_options.append("Ollama (Local LLM via official SDK)")
+    engine_options.append("Google Gemini API (Cloud Neural LLM)")
+    engine_options.append("Deterministic Psychoacoustic Rules (Offline Baseline)")
+
+    selected_backend = st.selectbox("LLM Inference Engine:", engine_options)
+
+    selected_ollama_model = "llama3.2"
+    gemini_api_key = ""
+
+    if "Ollama" in selected_backend:
+        selected_ollama_model = st.selectbox("Select Ollama Model:", installed_models)
+        with st.expander("📥 Pull / Download New Ollama Model"):
+            new_model = st.text_input("Model Tag (e.g. llama3.2, qwen2.5, mistral):", value="llama3.2")
+            if st.button("Pull Model"):
+                with st.spinner(f"Pulling {new_model} via Ollama SDK..."):
+                    try:
+                        llm_engine.pull_ollama_model(new_model)
+                        st.success(f"Successfully pulled {new_model}!")
+                        st.rerun()
+                    except Exception as err:
+                        st.error(f"Pull error: {err}")
+
+    elif "Gemini" in selected_backend:
+        gemini_api_key = st.text_input("Enter Gemini API Key:", type="password")
+        st.caption("Enter a Google Gemini API key to run neural LLM reasoning live without installing Ollama locally.")
+
+    else:
+        st.info("Using built-in deterministic psychoacoustic rules (Slide 11 frequency maps).")
 
     st.markdown("---")
-    st.subheader("3. DSP Processing Mode")
+
+    # 3. DSP Settings
+    st.subheader("3. DSP Resynthesis Mode")
     dsp_mode = st.radio(
-        "Filter Architecture:",
+        "Filter Mode:",
         ["STFT Bin Gain (Hann N=2048, hop=512)", "Time-Domain Biquad SOS"]
     )
     mode_key = "stft" if "STFT" in dsp_mode else "sos"
@@ -183,7 +260,7 @@ st.markdown("""
         Multi-Stem Audio Separation & Parametric EQ with LLM-Driven Natural Language Control
     </h2>
     <p style="margin: 0; color: #94a3b8; font-size: 14px;">
-        AI interprets natural language timbre descriptors into exact biquad filters, deterministic DSP processes the audio samples.
+        Real Demucs Neural Stem Separation + LLM Reasoning + Deterministic Biquad STFT Resynthesis.
     </p>
 </div>
 """, unsafe_allow_html=True)
@@ -194,13 +271,13 @@ st.markdown("### 1. Multi-Stem Audio Input & Stems")
 mix_col, stems_col = st.columns([1, 2])
 
 with mix_col:
-    st.markdown("#### 🎧 Full Mixed Track $x(t)$")
+    st.markdown("#### 🎧 Input Mixed Track $x(t)$")
     if st.session_state.mix_path and os.path.exists(st.session_state.mix_path):
         st.audio(st.session_state.mix_path)
         mix_data, sr = load_audio(st.session_state.mix_path)
         st.caption(f"Channels: Stereo | Sample Rate: {sr} Hz | Duration: {mix_data.shape[-1]/sr:.1f}s")
     else:
-        st.info("Load audio from sidebar.")
+        st.info("Select or upload audio in sidebar.")
 
 with stems_col:
     st.markdown("#### 🧩 Isolated Stems (Demucs 4-Stem Model)")
@@ -216,7 +293,7 @@ with stems_col:
             if p and os.path.exists(p):
                 st.audio(p)
             else:
-                st.caption("Not loaded")
+                st.caption("Waiting for separation...")
 
 st.markdown("---")
 
@@ -224,16 +301,14 @@ st.markdown("---")
 # ----------------- SECTION 2: NATURAL LANGUAGE PROMPT -----------------
 st.markdown("### 2. Natural Language Timbre Control (LLM Reasoning Layer)")
 
-# Quick preset prompts
 example_prompts = [
     "The vocal sounds too boxy and muddy, and I want the bass kick to have more punch.",
     "The drums are too harsh in the cymbals, add air to the vocals, and make the bass warmer.",
     "Tame sibilance on the singer and eliminate sub-rumble below 35 Hz on the mix.",
-    "Boost the vocal presence by +3 dB at 2500 Hz and make the keyboards brighter."
+    "Boost the vocal presence by +4 dB at 2500 Hz and make the keyboards brighter."
 ]
 
 selected_example = st.selectbox("Quick Preset Prompts (or type custom below):", ["-- Custom Prompt --"] + example_prompts)
-
 default_text = example_prompts[0] if selected_example == "-- Custom Prompt --" else selected_example
 user_prompt = st.text_input("Enter natural language mixing instruction:", value=default_text)
 
@@ -245,28 +320,45 @@ with col_run:
     run_button = st.button("🚀 Process Audio with AI", type="primary", use_container_width=True)
 
 if run_button and user_prompt:
-    with st.spinner("Translating natural language to biquad filter parameters..."):
-        plan = engine.generate_plan(user_prompt, force_expert_rules=force_expert)
-        # Apply intensity scaling to make EQ boldly audible
-        if intensity != 1.0:
-            for edit in plan.edits:
-                edit.gain_db = max(-12.0, min(12.0, round(edit.gain_db * intensity, 1)))
-        st.session_state.eq_plan = plan
+    if not st.session_state.stem_paths:
+        st.error("No stems available! Please load an audio track or preset first.")
+    else:
+        backend_tag = "rules"
+        if "Ollama" in selected_backend and ollama_online:
+            backend_tag = "ollama"
+        elif "Gemini" in selected_backend and gemini_api_key:
+            backend_tag = "gemini"
 
-    with st.spinner("Executing deterministic DSP & Resynthesizing master mix..."):
-        dsp = DSPEngine(mode=mode_key, fs=DEFAULT_SR)
-        out_dir = os.path.join("data", "output", "live_master_output")
-        results = dsp.process_stems(st.session_state.stem_paths, plan, output_dir=out_dir)
-        st.session_state.dsp_results = results
+        with st.spinner(f"Running LLM reasoning engine ({selected_backend})..."):
+            plan = llm_engine.generate_plan(
+                user_prompt,
+                backend_mode=backend_tag,
+                model_name=selected_ollama_model,
+                api_key=gemini_api_key
+            )
+            # Apply intensity scaling
+            if intensity != 1.0:
+                for edit in plan.edits:
+                    edit.gain_db = max(-12.0, min(12.0, round(edit.gain_db * intensity, 1)))
+            st.session_state.eq_plan = plan
 
-    st.success("✔ Audio successfully equalized and resynthesized!")
+        with st.spinner("Executing deterministic DSP & Resynthesizing master mix..."):
+            dsp = DSPEngine(mode=mode_key, fs=DEFAULT_SR)
+            out_dir = os.path.join("data", "output", f"processed_{st.session_state.current_track_id}")
+            results = dsp.process_stems(st.session_state.stem_paths, plan, output_dir=out_dir)
+            st.session_state.dsp_results = results
+
+        st.success("✔ Audio successfully equalized and resynthesized!")
 
 
 # ----------------- DISPLAY LLM REASONING JSON & FILTER CURVES -----------------
 if st.session_state.eq_plan is not None:
     plan: EQPlan = st.session_state.eq_plan
 
-    st.markdown(f"**Engineering Summary**: *{plan.summary}* &nbsp; <span class='badge'>Source: {plan.source.upper()}</span>", unsafe_allow_html=True)
+    st.markdown(
+        f"**Engineering Summary**: *{plan.summary}* &nbsp; <span class='badge-model'>Engine: {plan.source.upper()}</span>",
+        unsafe_allow_html=True
+    )
 
     json_col, curve_col = st.columns([1, 1])
 
@@ -340,7 +432,7 @@ if st.session_state.dsp_results is not None:
 
     with st.expander(f"🔍 Listen to Delta / Null Test Signal (The exact frequencies removed/altered from {selected_ab_stem.capitalize()})"):
         st.audio(delta_path)
-        st.caption("The Delta signal plays ONLY the acoustic difference (e.g. the removed boxy 300 Hz resonance). If you hear audio here, the EQ definitely reshaped the sound!")
+        st.caption("The Delta signal plays ONLY the acoustic difference. If you hear audio here, the EQ definitely reshaped the sound!")
 
 
     # ----------------- SECTION 4: LIVE SPECTROGRAM VISUALIZATION -----------------
@@ -366,4 +458,3 @@ if st.session_state.dsp_results is not None:
         stem_name=selected_stem_view
     )
     st.pyplot(spec_fig)
-

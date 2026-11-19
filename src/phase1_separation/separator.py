@@ -1,12 +1,12 @@
 """
-Phase 1: Stem Separation Module
-Supports both:
-1. Instant high-fidelity stock preset stems (Vocals, Drums, Bass, Other)
-2. Real Demucs 4-stem neural separation (if PyTorch & demucs package are installed)
+Phase 1: Real-Time Neural Stem Separation Module
+Powered by PyTorch + Hybrid Transformer Demucs (HT Demucs)
+Splits mixed audio x(t) into 4 isolated stems: vocals(t), drums(t), bass(t), other(t).
 """
 
 import os
-from typing import Dict, Tuple, Optional
+import hashlib
+from typing import Dict, Tuple, Optional, Callable
 import numpy as np
 
 from .audio_utils import (
@@ -22,12 +22,13 @@ from .stock_generator import create_stock_preset
 
 class StemSeparator:
     """
-    Modular Stem Separation Manager.
-    Separates a mix x(t) into: vocals(t), drums(t), bass(t), other(t).
+    Neural Stem Separation Manager using Meta's Demucs model.
+    Dynamically separates any input audio file into 4 distinct musical stems.
     """
 
     def __init__(self, model_name: str = "htdemucs"):
         self.model_name = model_name
+        self._model = None
         self._demucs_available = self._check_demucs_installed()
 
     @staticmethod
@@ -46,40 +47,40 @@ class StemSeparator:
     def separate(
         self,
         mix_audio_path: str,
-        output_dir: str,
-        force_preset_fallback: bool = False
+        output_dir: Optional[str] = None,
+        force_recompute: bool = False,
+        progress_callback: Optional[Callable[[float, str], None]] = None
     ) -> Dict[str, str]:
         """
-        Separates mix_audio_path into 4 stems.
-        If demucs is not installed or force_preset_fallback=True, uses the
-        matching stock stems or generates a preset fallback.
+        Dynamically separates mix_audio_path into 4 stems.
+        Uses real Demucs neural network for uploaded music.
         """
+        if not os.path.exists(mix_audio_path):
+            raise FileNotFoundError(f"Audio file not found: {mix_audio_path}")
+
+        # Determine unique output directory based on track hash/name
+        if output_dir is None:
+            track_name = os.path.splitext(os.path.basename(mix_audio_path))[0]
+            with open(mix_audio_path, "rb") as f:
+                file_hash = hashlib.md5(f.read(1024 * 512)).hexdigest()[:8]
+            output_dir = os.path.join("data", "output", f"separated_{track_name}_{file_hash}")
+
         os.makedirs(output_dir, exist_ok=True)
 
-        # Check if input directory itself already has stem files (e.g. stock preset dir)
+        # Check if this track is from a built-in stock preset that already has stems
         input_dir = os.path.dirname(os.path.abspath(mix_audio_path))
-        preset_stems_found = True
-        for name in STEM_NAMES:
-            p = os.path.join(input_dir, f"{name}.wav")
-            if not os.path.exists(p):
-                preset_stems_found = False
-                break
-
-        if preset_stems_found:
-            # Copy or return existing stem paths
-            stem_paths = {}
+        is_preset_dir = "presets" in input_dir.lower()
+        if is_preset_dir:
+            preset_stems_found = True
             for name in STEM_NAMES:
-                src_path = os.path.join(input_dir, f"{name}.wav")
-                dst_path = os.path.join(output_dir, f"{name}.wav")
-                if os.path.abspath(src_path) != os.path.abspath(dst_path):
-                    audio, sr = load_audio(src_path)
-                    save_audio(dst_path, audio, sr=sr)
-                    stem_paths[name] = dst_path
-                else:
-                    stem_paths[name] = src_path
-            return stem_paths
+                if not os.path.exists(os.path.join(input_dir, f"{name}.wav")):
+                    preset_stems_found = False
+                    break
+            if preset_stems_found and not force_recompute:
+                print(f"[Separator] Loading pre-rendered stock stems from {input_dir}")
+                return {name: os.path.join(input_dir, f"{name}.wav") for name in STEM_NAMES}
 
-        # Check if stems already exist in output directory
+        # Check if stems already exist in output directory for this exact track
         existing_stems = {}
         all_exist = True
         for name in STEM_NAMES:
@@ -89,38 +90,70 @@ class StemSeparator:
             else:
                 all_exist = False
 
-        if all_exist:
-            print(f"[Separator] Found existing stems in {output_dir}")
+        if all_exist and not force_recompute:
+            print(f"[Separator] Reusing previously separated stems from {output_dir}")
             return existing_stems
 
-        # If real Demucs is available and not forcing preset
-        if self._demucs_available and not force_preset_fallback:
-            print(f"[Separator] Running Demucs ({self.model_name}) separation...")
-            return self._run_demucs(mix_audio_path, output_dir)
-        else:
-            print("[Separator] Using preset audio generator mode (Demucs not loaded / preset mode active).")
-            # Generate stock audio into the output directory
-            _, stem_paths = create_stock_preset(output_dir)
-            return stem_paths
+        # Run real Demucs Neural Network
+        if not self._demucs_available:
+            raise RuntimeError(
+                "Demucs neural network is not installed in the environment. "
+                "Run: pip install torch torchaudio demucs"
+            )
 
-    def _run_demucs(self, audio_path: str, output_dir: str) -> Dict[str, str]:
-        """Runs real Demucs neural network separation."""
+        print(f"[Separator] Executing real Demucs ({self.model_name}) separation for: {mix_audio_path}")
+        return self._run_demucs(mix_audio_path, output_dir, progress_callback=progress_callback)
+
+    def _run_demucs(
+        self,
+        audio_path: str,
+        output_dir: str,
+        progress_callback: Optional[Callable[[float, str], None]] = None
+    ) -> Dict[str, str]:
+        """Runs real Demucs neural network separation on CPU or CUDA GPU."""
         import torch
         from demucs.apply import apply_model
         from demucs.pretrained import get_model
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[Demucs] Loading model '{self.model_name}' on {device}...")
-        model = get_model(self.model_name)
+        if progress_callback:
+            progress_callback(0.1, f"Loading Demucs neural model ({self.model_name}) on {device.upper()}...")
+
+        if self._model is None:
+            self._model = get_model(self.model_name)
+        model = self._model
         model.to(device)
         model.eval()
 
+        if progress_callback:
+            progress_callback(0.25, f"Reading and resampling audio to {model.samplerate} Hz...")
+
         audio, sr = load_audio(audio_path, target_sr=model.samplerate)
+        # Ensure stereo
+        if audio.shape[0] == 1:
+            audio = np.repeat(audio, 2, axis=0)
+
         wav = torch.tensor(audio, dtype=torch.float32, device=device).unsqueeze(0)
 
-        print("[Demucs] Performing 4-stem separation...")
+        if progress_callback:
+            progress_callback(0.4, "Neural network is separating stems (Vocals, Drums, Bass, Other)...")
+
+        def internal_callback(state):
+            if progress_callback and isinstance(state, dict):
+                pct = 0.4 + 0.45 * float(state.get("percent", 0.0)) / 100.0
+                progress_callback(min(pct, 0.88), "Separating audio waveforms...")
+
         with torch.no_grad():
-            sources = apply_model(model, wav, device=device)[0]  # shape: (stems, channels, time)
+            sources = apply_model(
+                model,
+                wav,
+                device=device,
+                progress=False,
+                callback=internal_callback
+            )[0]  # shape: (stems, channels, time)
+
+        if progress_callback:
+            progress_callback(0.9, "Saving isolated stems to disk...")
 
         stem_paths = {}
         for idx, name in enumerate(model.sources):
@@ -128,6 +161,9 @@ class StemSeparator:
             out_file = os.path.join(output_dir, f"{name}.wav")
             save_audio(out_file, stem_audio, sr=model.samplerate)
             stem_paths[name] = out_file
+
+        if progress_callback:
+            progress_callback(1.0, "Neural separation complete!")
 
         return stem_paths
 
@@ -145,4 +181,3 @@ class StemSeparator:
         reconstructed = sum_stems(stems)
         metrics = compute_reconstruction_metrics(mix_audio, reconstructed)
         return metrics
-
