@@ -8,11 +8,15 @@ import os
 import sys
 import json
 import hashlib
+import importlib
 import numpy as np
 import streamlit as st
 
 # Add current workspace to python path
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
+import src.phase2_llm.llm_engine
+importlib.reload(src.phase2_llm.llm_engine)
 
 from src.phase1_separation import (
     STEM_NAMES,
@@ -198,7 +202,16 @@ with st.sidebar:
     st.subheader("2. AI Reasoning Engine")
     if ollama_online:
         st.markdown("<span class='badge-online'>OLLAMA DAEMON: CONNECTED</span>", unsafe_allow_html=True)
-        installed_models = llm_engine.list_installed_ollama_models()
+        if hasattr(llm_engine, "list_installed_ollama_models"):
+            installed_models = llm_engine.list_installed_ollama_models()
+        else:
+            try:
+                import ollama
+                resp = ollama.Client(host="http://127.0.0.1:11434").list()
+                models = resp.get("models", []) if isinstance(resp, dict) else getattr(resp, "models", [])
+                installed_models = [m.get("model", "") if isinstance(m, dict) else getattr(m, "model", "") for m in models]
+            except Exception:
+                installed_models = []
         if not installed_models:
             installed_models = ["llama3.2", "qwen2.5"]
     else:
@@ -223,7 +236,11 @@ with st.sidebar:
             if st.button("Pull Model"):
                 with st.spinner(f"Pulling {new_model} via Ollama SDK..."):
                     try:
-                        llm_engine.pull_ollama_model(new_model)
+                        if hasattr(llm_engine, "pull_ollama_model"):
+                            llm_engine.pull_ollama_model(new_model)
+                        else:
+                            import ollama
+                            ollama.Client(host="http://127.0.0.1:11434").pull(new_model)
                         st.success(f"Successfully pulled {new_model}!")
                         st.rerun()
                     except Exception as err:
